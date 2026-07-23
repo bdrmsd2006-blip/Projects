@@ -1,0 +1,486 @@
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <cmath>
+#include <limits>
+#include <memory>
+#include <random>
+#include <thread>
+#include <atomic>
+#include <algorithm>
+
+constexpr double infinity = std::numeric_limits<double>::infinity();
+constexpr double pi = 3.14159265358979323846;
+
+inline double degrees_to_radians(double degrees) {
+    return degrees * pi / 180.0;
+}
+
+inline double random_double() {
+    thread_local std::mt19937 gen(std::random_device{}());
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    return dist(gen);
+}
+
+inline double random_double(double min, double max) {
+    return min + (max - min) * random_double();
+}
+
+inline double clamp(double x, double min, double max) {
+    if (x < min) return min;
+    if (x > max) return max;
+    return x;
+}
+
+// basic 3d vector struct
+struct Vec3 {
+    double e[3];
+
+    Vec3() : e{0, 0, 0} {}
+    Vec3(double e0, double e1, double e2) : e{e0, e1, e2} {}
+
+    double x() const { return e[0]; }
+    double y() const { return e[1]; }
+    double z() const { return e[2]; }
+
+    Vec3 operator-() const { return Vec3(-e[0], -e[1], -e[2]); }
+    double operator[](int i) const { return e[i]; }
+    double& operator[](int i) { return e[i]; }
+
+    Vec3& operator+=(const Vec3& v) {
+        e[0] += v.e[0]; e[1] += v.e[1]; e[2] += v.e[2];
+        return *this;
+    }
+
+    Vec3& operator*=(double t) {
+        e[0] *= t; e[1] *= t; e[2] *= t;
+        return *this;
+    }
+
+    double length_squared() const {
+        return e[0]*e[0] + e[1]*e[1] + e[2]*e[2];
+    }
+
+    double length() const {
+        return std::sqrt(length_squared());
+    }
+
+    static Vec3 random() {
+        return Vec3(random_double(), random_double(), random_double());
+    }
+
+    static Vec3 random(double min, double max) {
+        return Vec3(random_double(min, max), random_double(min, max), random_double(min, max));
+    }
+};
+
+using Point3 = Vec3;
+using Color = Vec3;
+
+inline Vec3 operator+(const Vec3& u, const Vec3& v) {
+    return Vec3(u.e[0] + v.e[0], u.e[1] + v.e[1], u.e[2] + v.e[2]);
+}
+
+inline Vec3 operator-(const Vec3& u, const Vec3& v) {
+    return Vec3(u.e[0] - v.e[0], u.e[1] - v.e[1], u.e[2] - v.e[2]);
+}
+
+inline Vec3 operator*(const Vec3& u, const Vec3& v) {
+    return Vec3(u.e[0] * v.e[0], u.e[1] * v.e[1], u.e[2] * v.e[2]);
+}
+
+inline Vec3 operator*(double t, const Vec3& v) {
+    return Vec3(t * v.e[0], t * v.e[1], t * v.e[2]);
+}
+
+inline Vec3 operator*(const Vec3& v, double t) {
+    return t * v;
+}
+
+inline Vec3 operator/(const Vec3& v, double t) {
+    return (1.0 / t) * v;
+}
+
+inline double dot(const Vec3& u, const Vec3& v) {
+    return u.e[0] * v.e[0] + u.e[1] * v.e[1] + u.e[2] * v.e[2];
+}
+
+inline Vec3 cross(const Vec3& u, const Vec3& v) {
+    return Vec3(
+        u.e[1] * v.e[2] - u.e[2] * v.e[1],
+        u.e[2] * v.e[0] - u.e[0] * v.e[2],
+        u.e[0] * v.e[1] - u.e[1] * v.e[0]
+    );
+}
+
+inline Vec3 unit_vector(Vec3 v) {
+    return v / v.length();
+}
+
+inline Vec3 random_in_unit_sphere() {
+    while (true) {
+        auto p = Vec3::random(-1, 1);
+        if (p.length_squared() >= 1) continue;
+        return p;
+    }
+}
+
+inline Vec3 random_unit_vector() {
+    return unit_vector(random_in_unit_sphere());
+}
+
+inline Vec3 reflect(const Vec3& v, const Vec3& n) {
+    return v - 2 * dot(v, n) * n;
+}
+
+inline Vec3 refract(const Vec3& uv, const Vec3& n, double etai_over_etat) {
+    auto cos_theta = std::min(dot(-uv, n), 1.0);
+    Vec3 r_out_perp = etai_over_etat * (uv + cos_theta * n);
+    Vec3 r_out_parallel = -std::sqrt(std::abs(1.0 - r_out_perp.length_squared())) * n;
+    return r_out_perp + r_out_parallel;
+}
+
+struct Ray {
+    Point3 orig;
+    Vec3 dir;
+
+    Point3 at(double t) const {
+        return orig + t * dir;
+    }
+};
+
+class Material;
+
+struct HitRecord {
+    Point3 p;
+    Vec3 normal;
+    std::shared_ptr<Material> mat_ptr;
+    double t;
+    bool front_face;
+
+    inline void set_face_normal(const Ray& r, const Vec3& outward_normal) {
+        front_face = dot(r.dir, outward_normal) < 0;
+        normal = front_face ? outward_normal : -outward_normal;
+    }
+};
+
+class Material {
+public:
+    virtual ~Material() = default;
+    virtual bool scatter(
+        const Ray& r_in, const HitRecord& rec, Color& attenuation, Ray& scattered
+    ) const = 0;
+};
+
+// matte diffuse surface
+class Lambertian : public Material {
+public:
+    Color albedo;
+
+    Lambertian(const Color& a) : albedo(a) {}
+
+    virtual bool scatter(
+        const Ray& r_in, const HitRecord& rec, Color& attenuation, Ray& scattered
+    ) const override {
+        auto scatter_dir = rec.normal + random_unit_vector();
+        if (scatter_dir.length_squared() < 1e-8)
+            scatter_dir = rec.normal;
+
+        scattered = Ray{rec.p, scatter_dir};
+        attenuation = albedo;
+        return true;
+    }
+};
+
+// metallic reflective surface
+class Metal : public Material {
+public:
+    Color albedo;
+    double fuzz;
+
+    Metal(const Color& a, double f) : albedo(a), fuzz(f < 1 ? f : 1) {}
+
+    virtual bool scatter(
+        const Ray& r_in, const HitRecord& rec, Color& attenuation, Ray& scattered
+    ) const override {
+        Vec3 reflected = reflect(unit_vector(r_in.dir), rec.normal);
+        scattered = Ray{rec.p, reflected + fuzz * random_in_unit_sphere()};
+        attenuation = albedo;
+        return (dot(scattered.dir, rec.normal) > 0);
+    }
+};
+
+// glass refractive surface
+class Dielectric : public Material {
+public:
+    double ir; // index of refraction
+
+    Dielectric(double index_of_refraction) : ir(index_of_refraction) {}
+
+    virtual bool scatter(
+        const Ray& r_in, const HitRecord& rec, Color& attenuation, Ray& scattered
+    ) const override {
+        attenuation = Color(1.0, 1.0, 1.0);
+        double refraction_ratio = rec.front_face ? (1.0 / ir) : ir;
+
+        Vec3 unit_direction = unit_vector(r_in.dir);
+        double cos_theta = std::min(dot(-unit_direction, rec.normal), 1.0);
+        double sin_theta = std::sqrt(1.0 - cos_theta * cos_theta);
+
+        bool cannot_refract = refraction_ratio * sin_theta > 1.0;
+        Vec3 direction;
+
+        if (cannot_refract || reflectance(cos_theta, refraction_ratio) > random_double())
+            direction = reflect(unit_direction, rec.normal);
+        else
+            direction = refract(unit_direction, rec.normal, refraction_ratio);
+
+        scattered = Ray{rec.p, direction};
+        return true;
+    }
+
+private:
+    static double reflectance(double cosine, double ref_idx) {
+        // schlick approximation
+        auto r0 = (1 - ref_idx) / (1 + ref_idx);
+        r0 = r0 * r0;
+        return r0 + (1 - r0) * std::pow((1 - cosine), 5);
+    }
+};
+
+class Hittable {
+public:
+    virtual ~Hittable() = default;
+    virtual bool hit(const Ray& r, double t_min, double t_max, HitRecord& rec) const = 0;
+};
+
+class Sphere : public Hittable {
+public:
+    Point3 center;
+    double radius;
+    std::shared_ptr<Material> mat_ptr;
+
+    Sphere(Point3 cen, double r, std::shared_ptr<Material> m)
+        : center(cen), radius(r), mat_ptr(m) {}
+
+    virtual bool hit(const Ray& r, double t_min, double t_max, HitRecord& rec) const override {
+        Vec3 oc = r.orig - center;
+        auto a = r.dir.length_squared();
+        auto half_b = dot(oc, r.dir);
+        auto c = oc.length_squared() - radius * radius;
+
+        auto discriminant = half_b * half_b - a * c;
+        if (discriminant < 0) return false;
+        auto sqrtd = std::sqrt(discriminant);
+
+        auto root = (-half_b - sqrtd) / a;
+        if (root < t_min || t_max < root) {
+            root = (-half_b + sqrtd) / a;
+            if (root < t_min || t_max < root)
+                return false;
+        }
+
+        rec.t = root;
+        rec.p = r.at(rec.t);
+        Vec3 outward_normal = (rec.p - center) / radius;
+        rec.set_face_normal(r, outward_normal);
+        rec.mat_ptr = mat_ptr;
+
+        return true;
+    }
+};
+
+// simple cube/box implementation
+class Box : public Hittable {
+public:
+    Point3 box_min, box_max;
+    std::shared_ptr<Material> mat_ptr;
+
+    Box(const Point3& p0, const Point3& p1, std::shared_ptr<Material> m)
+        : box_min(p0), box_max(p1), mat_ptr(m) {}
+
+    virtual bool hit(const Ray& r, double t_min, double t_max, HitRecord& rec) const override {
+        double t0 = t_min;
+        double t1 = t_max;
+        Vec3 normal_out;
+
+        for (int a = 0; a < 3; ++a) {
+            double invD = 1.0 / r.dir[a];
+            double tNear = (box_min[a] - r.orig[a]) * invD;
+            double tFar  = (box_max[a] - r.orig[a]) * invD;
+
+            Vec3 n_near(0, 0, 0);
+            n_near[a] = invD < 0 ? 1.0 : -1.0;
+
+            if (tNear > tFar) {
+                std::swap(tNear, tFar);
+                n_near[a] = -n_near[a];
+            }
+
+            if (tNear > t0) {
+                t0 = tNear;
+                normal_out = n_near;
+            }
+            if (tFar < t1) t1 = tFar;
+
+            if (t0 > t1) return false;
+        }
+
+        rec.t = t0;
+        rec.p = r.at(rec.t);
+        rec.set_face_normal(r, normal_out);
+        rec.mat_ptr = mat_ptr;
+        return true;
+    }
+};
+
+class HittableList : public Hittable {
+public:
+    std::vector<std::shared_ptr<Hittable>> objects;
+
+    HittableList() {}
+    HittableList(std::shared_ptr<Hittable> object) { add(object); }
+
+    void add(std::shared_ptr<Hittable> object) { objects.push_back(object); }
+
+    virtual bool hit(const Ray& r, double t_min, double t_max, HitRecord& rec) const override {
+        HitRecord temp_rec;
+        bool hit_anything = false;
+        auto closest_so_far = t_max;
+
+        for (const auto& object : objects) {
+            if (object->hit(r, t_min, closest_so_far, temp_rec)) {
+                hit_anything = true;
+                closest_so_far = temp_rec.t;
+                rec = temp_rec;
+            }
+        }
+
+        return hit_anything;
+    }
+};
+
+class Camera {
+public:
+    Point3 origin;
+    Point3 lower_left_corner;
+    Vec3 horizontal;
+    Vec3 vertical;
+
+    Camera(Point3 lookfrom, Point3 lookat, Vec3 vup, double vfov, double aspect_ratio) {
+        auto theta = degrees_to_radians(vfov);
+        auto h = std::tan(theta / 2);
+        auto viewport_height = 2.0 * h;
+        auto viewport_width = aspect_ratio * viewport_height;
+
+        auto w = unit_vector(lookfrom - lookat);
+        auto u = unit_vector(cross(vup, w));
+        auto v = cross(w, u);
+
+        origin = lookfrom;
+        horizontal = viewport_width * u;
+        vertical = viewport_height * v;
+        lower_left_corner = origin - horizontal / 2 - vertical / 2 - w;
+    }
+
+    Ray get_ray(double s, double t) const {
+        return Ray{origin, lower_left_corner + s * horizontal + t * vertical - origin};
+    }
+};
+
+Color ray_color(const Ray& r, const Hittable& world, int depth) {
+    HitRecord rec;
+
+    // bounce limit check
+    if (depth <= 0)
+        return Color(0, 0, 0);
+
+    if (world.hit(r, 0.001, infinity, rec)) {
+        Ray scattered;
+        Color attenuation;
+        if (rec.mat_ptr->scatter(r, rec, attenuation, scattered))
+            return attenuation * ray_color(scattered, world, depth - 1);
+        return Color(0, 0, 0);
+    }
+
+    // sky background
+    Vec3 unit_dir = unit_vector(r.dir);
+    auto t = 0.5 * (unit_dir.y() + 1.0);
+    return (1.0 - t) * Color(1.0, 1.0, 1.0) + t * Color(0.5, 0.7, 1.0);
+}
+
+int main() {
+    // image config
+    const double aspect_ratio = 16.0 / 9.0;
+    const int image_width = 800;
+    const int image_height = static_cast<int>(image_width / aspect_ratio);
+    const int samples_per_pixel = 100;
+    const int max_depth = 50;
+
+    // materials setup
+    auto mat_ground = std::make_shared<Lambertian>(Color(0.2, 0.8, 0.2));
+    auto mat_cube   = std::make_shared<Metal>(Color(0.9, 0.7, 0.2), 0.05);
+    auto mat_sphere = std::make_shared<Dielectric>(1.5);
+    auto mat_center = std::make_shared<Lambertian>(Color(0.8, 0.2, 0.2));
+
+    // scene geometry
+    HittableList world;
+    world.add(std::make_shared<Sphere>(Point3(0, -1000.5, -1), 1000, mat_ground));
+    world.add(std::make_shared<Box>(Point3(-1.2, 0.0, -1.5), Point3(-0.2, 1.0, -0.5), mat_cube));
+    world.add(std::make_shared<Sphere>(Point3(0.6, 0.5, -1.0), 0.5, mat_sphere));
+    world.add(std::make_shared<Sphere>(Point3(0.0, 0.2, -0.4), 0.2, mat_center));
+
+    // camera
+    Camera cam(Point3(0, 2, 2.5), Point3(0, 0.3, -1), Vec3(0, 1, 0), 50, aspect_ratio);
+
+    // threads render setup
+    std::vector<Color> buffer(image_width * image_height);
+    std::atomic<int> scanlines_left(image_height);
+    const unsigned int threads_count = std::thread::hardware_concurrency();
+    std::vector<std::thread> threads;
+
+    auto render_chunk = [&]() {
+        while (true) {
+            int j = --scanlines_left;
+            if (j < 0) break;
+
+            for (int i = 0; i < image_width; ++i) {
+                Color pixel_color(0, 0, 0);
+                for (int s = 0; s < samples_per_pixel; ++s) {
+                    auto u = (i + random_double()) / (image_width - 1);
+                    auto v = (j + random_double()) / (image_height - 1);
+                    Ray r = cam.get_ray(u, v);
+                    pixel_color += ray_color(r, world, max_depth);
+                }
+                buffer[(image_height - 1 - j) * image_width + i] = pixel_color;
+            }
+        }
+    };
+
+    for (unsigned int t = 0; t < threads_count; ++t) {
+        threads.emplace_back(render_chunk);
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // output image file
+    std::ofstream file("render.ppm");
+    file << "P3\n" << image_width << " " << image_height << "\n255\n";
+
+    for (int idx = 0; idx < image_width * image_height; ++idx) {
+        Color c = buffer[idx];
+        
+        auto scale = 1.0 / samples_per_pixel;
+        auto r = std::sqrt(scale * c.x());
+        auto g = std::sqrt(scale * c.y());
+        auto b = std::sqrt(scale * c.z());
+
+        file << static_cast<int>(256 * clamp(r, 0.0, 0.999)) << " "
+             << static_cast<int>(256 * clamp(g, 0.0, 0.999)) << " "
+             << static_cast<int>(256 * clamp(b, 0.0, 0.999)) << "\n";
+    }
+
+    return 0;
+}
